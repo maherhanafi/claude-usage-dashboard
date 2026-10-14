@@ -134,11 +134,11 @@ export function SettingsModal({
             </div>
           </div>
           <div className="range-toggle">
-            <button className={cumulativeChartsEnabled ? "active" : ""} onClick={() => onCumulativeChartsEnabled(true)}>
-              On
-            </button>
             <button className={!cumulativeChartsEnabled ? "active" : ""} onClick={() => onCumulativeChartsEnabled(false)}>
               Off
+            </button>
+            <button className={cumulativeChartsEnabled ? "active" : ""} onClick={() => onCumulativeChartsEnabled(true)}>
+              On
             </button>
           </div>
         </div>
@@ -150,11 +150,11 @@ export function SettingsModal({
             </div>
           </div>
           <div className="range-toggle">
-            <button className={monthForecastEnabled ? "active" : ""} onClick={() => onMonthForecastEnabled(true)}>
-              On
-            </button>
             <button className={!monthForecastEnabled ? "active" : ""} onClick={() => onMonthForecastEnabled(false)}>
               Off
+            </button>
+            <button className={monthForecastEnabled ? "active" : ""} onClick={() => onMonthForecastEnabled(true)}>
+              On
             </button>
           </div>
         </div>
@@ -166,11 +166,11 @@ export function SettingsModal({
             </div>
           </div>
           <div className="range-toggle">
-            <button className={showLastMonthAnalysis ? "active" : ""} onClick={() => onShowLastMonthAnalysis(true)}>
-              On
-            </button>
             <button className={!showLastMonthAnalysis ? "active" : ""} onClick={() => onShowLastMonthAnalysis(false)}>
               Off
+            </button>
+            <button className={showLastMonthAnalysis ? "active" : ""} onClick={() => onShowLastMonthAnalysis(true)}>
+              On
             </button>
           </div>
         </div>

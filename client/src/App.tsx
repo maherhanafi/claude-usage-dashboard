@@ -352,7 +352,7 @@ export function App() {
   const [showCostTypes, setShowCostTypes] = useState(false);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   const [chartType, setChartType] = useState<ChartType>(() =>
-    localStorage.getItem("dashChartType") === "bar" ? "bar" : "area",
+    localStorage.getItem("dashChartType") === "area" ? "area" : "bar",
   );
   const [granularity, setGranularity] = useState<Granularity>(() => {
     const v = localStorage.getItem("dashGranularity");

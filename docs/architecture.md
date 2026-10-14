@@ -14,8 +14,8 @@ flowchart LR
     A2[Anthropic Admin API]
     W[Startup Warmup<br/>Last 180 completed days]
     H[Hourly Current-Day Refresh]
-    DD[/api/dashboard]
-    HE[/api/health]
+    DD[/api/dashboard/]
+    HE[/api/health/]
 
     U --> C
     C -->|GET dashboard data| DD

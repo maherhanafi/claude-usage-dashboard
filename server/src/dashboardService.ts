@@ -46,6 +46,7 @@ const SUMMARY_LAG_MS = 2 * DAY_MS;
 export const RECENT_HISTORY_DAYS = 180;
 export const CURRENT_DAY_REFRESH_MS = HOUR_MS;
 const HISTORY_WARMUP_CONCURRENCY = config.historyWarmupConcurrency;
+const UNFILTERED_PRIMED_PERIODS = ["today", "7d", "14d", "30d", "90d", "180d", "this_month", "last_month"] as const;
 
 const daySpan = (bounds: Bounds): number =>
   Math.max(1, Math.round((new Date(bounds.endingAt).getTime() - new Date(bounds.startingAt).getTime()) / DAY_MS));
@@ -658,6 +659,10 @@ function buildScopeId(scope: DashboardScope): string | undefined {
   return undefined;
 }
 
+function isUnfilteredScope(scope: DashboardScope): boolean {
+  return !scope.userId && !scope.groupId;
+}
+
 function computeDashboard(
   bounds: Bounds,
   previousBounds: Bounds | undefined,
@@ -947,6 +952,38 @@ async function loadHistoricalDashboardFromDb(
   return composePersistedDashboard(currentRows, bounds, previousRows);
 }
 
+async function loadPersistedDashboard(
+  bounds: Bounds,
+  previous: Bounds | undefined,
+  snapshotKey: SnapshotKey,
+  scope: DashboardScope,
+): Promise<DashboardPayload | null> {
+  const preferHistorical = isOngoingRange(bounds);
+  const exactPersisted = await loadDashboardSnapshotForRange({
+    source: config.source,
+    userId: snapshotKey.userId,
+    rangeStart: bounds.startingAt,
+    rangeEnd: bounds.endingAt,
+  });
+  const historicalPersisted = await loadHistoricalDashboardFromDb(bounds, previous, snapshotKey.userId, scope.userId);
+  const requestPersisted = await loadDashboardSnapshot({
+    source: config.source,
+    requestKey: snapshotKey.requestKey,
+    userId: snapshotKey.userId,
+    rangeStart: bounds.startingAt,
+    rangeEnd: bounds.endingAt,
+  });
+  const persistedCandidates = preferHistorical
+    ? [historicalPersisted, exactPersisted, requestPersisted]
+    : [exactPersisted, historicalPersisted, requestPersisted];
+  const consistentCandidates = persistedCandidates.filter((payload): payload is DashboardPayload =>
+    payload ? hasConsistentAnalyticsSnapshot(payload, scope.userId) : false,
+  );
+  return consistentCandidates.find((payload) => payload.source !== "analytics" || hasAnalyticsUsageViews(payload))
+    ?? consistentCandidates[0]
+    ?? null;
+}
+
 // ── 1-hour response cache ─────────────────────────────────────────────────────
 // Usage/cost data changes slowly (cost refreshes ~every 4h, engagement daily),
 // and the Analytics API is rate-limited to ~60 req/min per org. Caching the
@@ -981,6 +1018,25 @@ export function getHistorySyncStatus(): HistorySyncStatus {
     },
     currentDay: { ...historySyncStatus.currentDay },
   };
+}
+
+async function primeUnfilteredPeriodSnapshots(): Promise<void> {
+  if (config.source !== "analytics") return;
+
+  const scope: DashboardScope = {};
+  await Promise.all(
+    UNFILTERED_PRIMED_PERIODS.map(async (period) => {
+      const bounds = periodBounds(period);
+      const previous = previousBounds(period, bounds);
+      const snapshotKey: SnapshotKey = { requestKey: period, userId: undefined };
+      const persisted = await loadPersistedDashboard(bounds, previous, snapshotKey, scope);
+      if (!persisted) return;
+
+      const enriched = await enrichAnalyticsUsageViews(persisted, bounds, scope);
+      await persistSnapshot(snapshotKey, enriched);
+      cache.set(`${config.source}:${period}:all`, { payload: enriched, expiresAt: Date.now() + CACHE_TTL_MS });
+    }),
+  );
 }
 
 async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
@@ -1035,32 +1091,12 @@ export async function getDashboard(period: string, force = false, userId?: strin
 
   const bounds = periodBounds(period);
   const previous = previousBounds(period, bounds);
-  const preferHistorical = isOngoingRange(bounds);
 
   const cached = cache.get(key);
   if (!force && cached && cached.expiresAt > now) return enrichAnalyticsUsageViews(cached.payload, bounds, scope);
 
   if (!force) {
-    const exactPersisted = await loadDashboardSnapshotForRange({
-      source: config.source,
-      userId: snapshotKey.userId,
-      rangeStart: bounds.startingAt,
-      rangeEnd: bounds.endingAt,
-    });
-    const historicalPersisted = await loadHistoricalDashboardFromDb(bounds, previous, scopeId, userId);
-    const requestPersisted = await loadDashboardSnapshot({
-      source: config.source,
-      requestKey: snapshotKey.requestKey,
-      userId: snapshotKey.userId,
-      rangeStart: bounds.startingAt,
-      rangeEnd: bounds.endingAt,
-    });
-    const persistedCandidates = preferHistorical
-      ? [historicalPersisted, exactPersisted, requestPersisted]
-      : [exactPersisted, historicalPersisted, requestPersisted];
-    const persisted = persistedCandidates.find((payload) =>
-      payload ? hasConsistentAnalyticsSnapshot(payload, userId) : false,
-    );
+    const persisted = await loadPersistedDashboard(bounds, previous, snapshotKey, scope);
     if (persisted) {
       const enriched = await enrichAnalyticsUsageViews(persisted, bounds, scope);
       cache.set(key, { payload: enriched, expiresAt: Date.now() + CACHE_TTL_MS });
@@ -1075,6 +1111,9 @@ export async function getDashboard(period: string, force = false, userId?: strin
       const enriched = await enrichAnalyticsUsageViews(payload, bounds, scope);
       await persistSnapshot(snapshotKey, enriched);
       cache.set(key, { payload: enriched, expiresAt: Date.now() + CACHE_TTL_MS });
+      if (period === "180d" && isUnfilteredScope(scope)) {
+        await primeUnfilteredPeriodSnapshots();
+      }
       return enriched;
     })
     .catch(async (err: Error) => {
@@ -1085,26 +1124,7 @@ export async function getDashboard(period: string, force = false, userId?: strin
         return enrichAnalyticsUsageViews(stale.payload, bounds, scope);
       }
 
-      const exactPersisted = await loadDashboardSnapshotForRange({
-        source: config.source,
-        userId: snapshotKey.userId,
-        rangeStart: bounds.startingAt,
-        rangeEnd: bounds.endingAt,
-      });
-      const requestPersisted = await loadDashboardSnapshot({
-        source: config.source,
-        requestKey: snapshotKey.requestKey,
-        userId: snapshotKey.userId,
-        rangeStart: bounds.startingAt,
-        rangeEnd: bounds.endingAt,
-      });
-      const historicalPersisted = await loadHistoricalDashboardFromDb(bounds, previous, scopeId, userId);
-      const persistedCandidates = preferHistorical
-        ? [historicalPersisted, exactPersisted, requestPersisted]
-        : [exactPersisted, historicalPersisted, requestPersisted];
-      const persisted = persistedCandidates.find((payload) =>
-        payload ? hasConsistentAnalyticsSnapshot(payload, userId) : false,
-      );
+      const persisted = await loadPersistedDashboard(bounds, previous, snapshotKey, scope);
       if (persisted) {
         console.warn(`[db] upstream error for ${key}; serving persisted snapshot: ${err.message}`);
         const enriched = await enrichAnalyticsUsageViews(persisted, bounds, scope);

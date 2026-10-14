@@ -15,6 +15,9 @@ const configState = {
 
 const getAnalyticsUsageBuckets = vi.fn();
 const getAnalyticsCostBuckets = vi.fn();
+const getConnectorUsage = vi.fn();
+const getPluginUsage = vi.fn();
+const getSkillUsage = vi.fn();
 const getSummaries = vi.fn();
 const getUserCost = vi.fn();
 const getUserUsage = vi.fn();
@@ -30,7 +33,10 @@ vi.mock("./config.js", () => ({
 }));
 
 vi.mock("./anthropicAnalytics.js", () => ({
+  getConnectorUsage,
   getCostBuckets: getAnalyticsCostBuckets,
+  getPluginUsage,
+  getSkillUsage,
   getSummaries,
   getUsageBuckets: getAnalyticsUsageBuckets,
   getUserCost,
@@ -155,6 +161,9 @@ describe("getDashboard", () => {
 
     getAnalyticsUsageBuckets.mockReset();
     getAnalyticsCostBuckets.mockReset();
+    getConnectorUsage.mockReset();
+    getPluginUsage.mockReset();
+    getSkillUsage.mockReset();
     getSummaries.mockReset();
     getUserCost.mockReset();
     getUserUsage.mockReset();
@@ -167,6 +176,9 @@ describe("getDashboard", () => {
     loadDashboardSnapshot.mockResolvedValue(null);
     isPersistenceEnabled.mockReturnValue(true);
     persistDashboardSnapshot.mockResolvedValue(undefined);
+    getConnectorUsage.mockResolvedValue([]);
+    getPluginUsage.mockResolvedValue([]);
+    getSkillUsage.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -729,6 +741,9 @@ describe("getDashboard", () => {
 
     getAnalyticsUsageBuckets.mockClear();
     getAnalyticsCostBuckets.mockClear();
+    getConnectorUsage.mockClear();
+    getPluginUsage.mockClear();
+    getSkillUsage.mockClear();
     getUserUsage.mockClear();
     getUserCost.mockClear();
     getSummaries.mockClear();
@@ -739,6 +754,9 @@ describe("getDashboard", () => {
     expect(loadDailyDashboardSnapshots).toHaveBeenCalled();
     expect(getAnalyticsUsageBuckets).not.toHaveBeenCalled();
     expect(getAnalyticsCostBuckets).not.toHaveBeenCalled();
+    expect(getPluginUsage).not.toHaveBeenCalled();
+    expect(getSkillUsage).not.toHaveBeenCalled();
+    expect(getConnectorUsage).not.toHaveBeenCalled();
     expect(getUserUsage).not.toHaveBeenCalled();
     expect(getUserCost).not.toHaveBeenCalled();
     expect(getSummaries).not.toHaveBeenCalled();

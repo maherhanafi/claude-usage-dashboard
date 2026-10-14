@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Engineering",
+    "emails": [
+      "alice@example.com",
+      "bob@example.com"
+    ]
+  },
+  {
+    "name": "Product and Design",
+    "emails": [
+      "carol@example.com",
+      "dave@example.com"
+    ]
+  },
+  {
+    "name": "IT",
+    "emails": [
+      "it-admin@example.com"
+    ]
+  }
+]

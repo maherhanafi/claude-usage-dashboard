@@ -1,0 +1,9 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "npm exec": true,
+        "./client/node_modules/.bin/vitest": true,
+        "npm run dev:server": true,
+        "psql": true,
+        "lsof": true
+    }
+}

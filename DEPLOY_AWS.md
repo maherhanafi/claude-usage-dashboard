@@ -1,469 +1,468 @@
-# Deploying to AWS Lambda
+# Deploy to AWS
 
-This document covers deploying the Claude Usage Dashboard to AWS:
+This project can run on AWS in two ways:
 
-- **Frontend** — React SPA → **S3 + CloudFront**
-- **Backend** — Express API → **AWS Lambda + Function URL** (or API Gateway HTTP API)
+- **Serverless**: S3 + CloudFront for the frontend, Lambda for the API.
+- **Server-based**: EC2 + Nginx + PM2 + Postgres on one VM.
 
-No containers, no persistent servers. The entire stack is serverless.
+If you want the easiest path for this repo today, use **Server-based (EC2)**.
 
----
+The current backend assumes a long-running process for warmup, caching, and scheduled refresh behavior, which maps more naturally to EC2 than Lambda.
 
-## Architecture
+--- 
 
-```
-Browser
-  │
-  ├─ GET /  (static assets) ──────► CloudFront ──► S3 bucket (client/dist)
-  │
-  └─ GET /api/*  (API calls) ──────► CloudFront ──► Lambda Function URL
-                                                         │
-                                                  serverless-express wrapper
-                                                         │
-                                                  Express app (src/index.ts)
-                                                         │
-                                              ┌──────────┴──────────┐
-                                        Anthropic Analytics API  Anthropic Admin API
-```
+## Choose a deployment path
 
-**Important Lambda cache note:** The in-memory 1-hour cache in `dashboardService.ts` works per Lambda instance. Warm instances reuse the cache normally, but cold starts always hit Anthropic's API fresh. For an internal dashboard with low traffic this is fine. If you need persistent caching across instances, see [Optional: Persistent cache](#optional-persistent-cache-with-dynamodb) below.
+| Path | Best when | Tradeoffs |
+|------|-----------|-----------|
+| Serverless | You want minimal server management and are willing to adapt the backend for Lambda | Cheapest steady-state footprint, but this repo needs refactoring for the best result |
+| Server-based | You want the fastest, clearest deployment with the current codebase | You manage one server, but behavior matches the app as written |
 
 ---
 
-## Prerequisites
+## Option 1: Serverless
 
-| Tool | Install |
-|------|---------|
-| Node.js 20+ | [nodejs.org](https://nodejs.org) |
-| AWS CLI v2 | `brew install awscli` then `aws configure` |
-| AWS CDK CLI | `npm install -g aws-cdk` |
-| An AWS account | With a region selected |
+Use this when you specifically want AWS-managed infrastructure and are comfortable changing the backend shape.
+
+### Recommended architecture
+
+- Frontend: S3 + CloudFront
+- Backend: Lambda behind Function URL or API Gateway
+- Secrets: AWS Secrets Manager
+- Optional persistent cache: DynamoDB
+
+### Why this is not the easiest path for this repo
+
+The current backend was built around a long-lived Node process. In Lambda:
+
+- the in-memory cache is only per warm instance
+- cold starts lose cache state
+- startup warmup and hourly refresh logic need redesign
+- long `180d` fetches are more likely to hit timeout or cold-start latency issues
+
+### What you would need to change
+
+1. Split the Express app from the `listen()` boot path.
+2. Add a Lambda adapter such as `@vendia/serverless-express`.
+3. Move warmup/refresh behavior out of process startup.
+4. Replace or supplement in-memory caching with DynamoDB if cross-instance reuse matters.
+5. Re-test large-range requests such as `90d` and `180d` under Lambda timeouts.
+
+### High-level serverless flow
+
+1. Build the frontend and deploy `client/dist` to S3.
+2. Put CloudFront in front of S3.
+3. Package the server for Lambda.
+4. Store Anthropic keys in Secrets Manager.
+5. Deploy Lambda and expose it through Function URL or API Gateway.
+6. Route `/api/*` from CloudFront to Lambda.
+
+### When to choose this anyway
+
+Choose serverless if:
+
+- traffic is light and bursty
+- you want to avoid patching and maintaining a VM
+- you are willing to trade some app simplicity for infrastructure simplicity
+
+---
+
+## Option 2: Server-based (EC2)
+
+This is the recommended deployment path for the current codebase.
+
+### Architecture
+
+- Frontend build served by the backend or by Nginx
+- Node/Express API running on EC2
+- PM2 managing the Node process
+- Nginx as reverse proxy on port 80
+- Postgres on the same EC2 instance
+- Anthropic keys stored in AWS Secrets Manager
+- EC2 IAM role used to fetch secrets securely
+
+### What this gives you
+
+- behavior consistent with local development
+- warm process state for the in-memory cache
+- reuse of persisted dashboard snapshots in Postgres
+- simpler debugging over SSH
+- no Lambda adaptation work
+
+---
+
+## EC2 deployment guide
+
+These steps are based on the deployment flow already validated for this repo.
+
+### 1. Create the EC2 instance
+
+Recommended baseline:
+
+- Ubuntu 24.04 LTS
+- `t3.small` or `t3.medium`
+- 20 to 30 GB gp3 storage
+- security group allowing:
+  - `22` from your IP only
+  - `80` from your users or internal network
+  - optionally `443` if you add TLS later
+
+If this should stay internal, do not open access broadly. Restrict by office IP, VPN, or private network controls.
+
+### 2. Attach an Elastic IP
+
+Attach an Elastic IP if you want the server address to remain stable across stops/starts.
+
+Later, point a DNS record such as `dashboard.example.com` at that Elastic IP.
+
+### 3. Create the secret in AWS Secrets Manager
+
+Store your API keys in one secret. Use placeholders below, not real keys in files.
 
 ```bash
-# Verify
-aws sts get-caller-identity   # must return your account ID
-cdk --version                 # 2.x
-```
-
----
-
-## Step 1 — Adapt the Express server for Lambda
-
-Install the Lambda adapter. This wraps the Express app so it can handle Lambda's event format.
-
-```bash
-cd server
-npm install @vendia/serverless-express
-npm install -D @types/aws-lambda
-```
-
-Create `server/src/lambda.ts` — the Lambda handler entry point:
-
-```typescript
-import serverlessExpress from "@vendia/serverless-express";
-import { app } from "./app.js";   // see Step 2
-
-export const handler = serverlessExpress({ app });
-```
-
-> **Step 2 — Split `index.ts` into `app.ts` + `lambda.ts`**
->
-> Currently `index.ts` both builds the Express app and calls `app.listen()`.
-> Lambda doesn't call `listen()` — the adapter handles the HTTP layer.
-> You need to export the `app` instance separately so `lambda.ts` can import it
-> without triggering `listen()`.
-
-Create `server/src/app.ts` — everything from `index.ts` except the `app.listen()` call:
-
-```typescript
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import fs from "node:fs";
-import cors from "cors";
-import express from "express";
-import { config } from "./config.js";
-import { getDashboard } from "./dashboardService.js";
-import { HttpApiError } from "./httpError.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, source: config.source });
-});
-
-app.get("/api/dashboard", async (req, res) => {
-  const period =
-    typeof req.query.period === "string" && req.query.period
-      ? req.query.period
-      : `${Number(req.query.days) || 7}d`;
-  const force = req.query.refresh === "1" || req.query.refresh === "true";
-  const userId =
-    typeof req.query.user === "string" && req.query.user ? req.query.user : undefined;
-  try {
-    const payload = await getDashboard(period, force, userId);
-    res.json(payload);
-  } catch (err) {
-    if (err instanceof HttpApiError) {
-      console.error(`[${err.api}-api] ${err.message}`);
-      const message =
-        err.api === "analytics"
-          ? err.status === 401 || err.status === 403
-            ? "Anthropic rejected the Analytics API key."
-            : `Anthropic Analytics API returned ${err.status}.`
-          : err.status === 401
-            ? "Anthropic rejected the Admin API key (401)."
-            : `Anthropic Admin API returned ${err.status}.`;
-      res.status(502).json({ error: `${err.api}_api_error`, status: err.status, message });
-    } else {
-      console.error("[dashboard] unexpected error", err);
-      res.status(500).json({ error: "internal_error", message: (err as Error).message });
-    }
-  }
-});
-
-// Serve bundled frontend when available (optional, for local `npm start`).
-const clientDist = path.resolve(__dirname, "../../client/dist");
-if (fs.existsSync(clientDist)) {
-  app.use(express.static(clientDist));
-  app.get("*", (_req, res) => res.sendFile(path.join(clientDist, "index.html")));
-}
-```
-
-Update `server/src/index.ts` to import and start the app:
-
-```typescript
-import { app } from "./app.js";
-import { config } from "./config.js";
-
-app.listen(config.port, () => {
-  console.log(`  ▶ http://localhost:${config.port}`);
-});
-```
-
-Update `server/tsconfig.json` to include the new entry point (or it is already covered by `"include": ["src"]`).
-
----
-
-## Step 2 — Store API keys in AWS Secrets Manager
-
-Never put secrets in Lambda environment variables as plain text if you can avoid it. Use Secrets Manager.
-
-```bash
-# Create the secret (run once)
 aws secretsmanager create-secret \
-  --name "claude-dashboard/api-keys" \
+  --name claude-usage-dashboard/prod \
   --secret-string '{
-    "ANTHROPIC_ANALYTICS_KEY": "sk-ant-api01-...",
-    "ANTHROPIC_ADMIN_KEY": "sk-ant-admin01-..."
+    "ANTHROPIC_ADMIN_KEY":"REPLACE_ME",
+    "ANTHROPIC_ANALYTICS_KEY":"REPLACE_ME",
+    "ANTHROPIC_VERSION":"2023-06-01",
+    "ANTHROPIC_BASE_URL":"https://api.anthropic.com"
   }'
 ```
 
-The Lambda execution role (created by CDK below) is granted `secretsmanager:GetSecretValue` on this secret. The app reads the keys from **environment variables** that Lambda sets at startup — you populate those from the secret in the CDK stack (see Step 4).
+If the secret already exists, update it with `put-secret-value`.
 
-Alternatively, for simplicity you can pass them directly as Lambda env vars in the CDK stack; the trade-off is that they appear in plain text in the Lambda console.
+### 4. Create and attach an EC2 IAM role
 
----
+Create an IAM role for EC2 with permission to read only that secret.
 
-## Step 3 — Build both packages
+Minimum access needed:
 
-```bash
-# From the project root
-cd client && npm run build && cd ..
-cd server && npm run build && cd ..
-```
+- `secretsmanager:GetSecretValue` on the deployment secret
 
-`client/dist` will be copied to S3.
-`server/dist` will be zipped and uploaded to Lambda.
+Attach the role to the EC2 instance through an instance profile. This avoids hardcoding AWS credentials on the box.
 
----
-
-## Step 4 — CDK stack
-
-Create a new CDK app alongside the project:
+### 5. SSH into the instance and install system packages
 
 ```bash
-mkdir infra && cd infra
-npx cdk init app --language typescript
-npm install aws-cdk-lib constructs
+sudo apt update
+sudo apt install -y nginx postgresql postgresql-contrib unzip curl git build-essential
 ```
 
-Replace `infra/lib/infra-stack.ts` with:
+Install Node.js 20:
 
-```typescript
-import * as cdk from "aws-cdk-lib";
-import * as lambda from "aws-cdk-lib/aws-lambda";
-import * as s3 from "aws-cdk-lib/aws-s3";
-import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
-import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
-import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
-import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
-import * as iam from "aws-cdk-lib/aws-iam";
-import { Construct } from "constructs";
-import path from "node:path";
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v
+npm -v
+```
 
-export class InfraStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
-    super(scope, id, props);
+Install PM2 globally:
 
-    // ── Secrets ──────────────────────────────────────────────────────────────
-    const apiSecret = secretsmanager.Secret.fromSecretNameV2(
-      this,
-      "ApiKeys",
-      "claude-dashboard/api-keys",
-    );
+```bash
+sudo npm install -g pm2
+pm2 -v
+```
 
-    // ── Lambda (API backend) ──────────────────────────────────────────────────
-    const fn = new lambda.Function(this, "DashboardApi", {
-      runtime: lambda.Runtime.NODEJS_20_X,
-      handler: "lambda.handler",           // server/dist/lambda.js → handler export
-      code: lambda.Code.fromAsset(
-        path.join(__dirname, "../../server/dist"),
-      ),
-      architecture: lambda.Architecture.ARM_64,  // cheaper + faster for Node
-      memorySize: 512,
-      timeout: cdk.Duration.seconds(60),   // analytics fetches can take 10-20s on 90d
-      environment: {
-        NODE_ENV: "production",
-        // Resolve secrets into env vars at deploy time.
-        // Use dynamic resolution so the value isn't in CloudFormation plaintext.
-        ANTHROPIC_ANALYTICS_KEY: cdk.SecretValue.secretsManager(
-          "claude-dashboard/api-keys",
-          { jsonField: "ANTHROPIC_ANALYTICS_KEY" },
-        ).unsafeUnwrap(),
-        ANTHROPIC_ADMIN_KEY: cdk.SecretValue.secretsManager(
-          "claude-dashboard/api-keys",
-          { jsonField: "ANTHROPIC_ADMIN_KEY" },
-        ).unsafeUnwrap(),
-        ANTHROPIC_VERSION: "2023-06-01",
-        ANTHROPIC_BASE_URL: "https://api.anthropic.com",
-        USE_MOCK: "false",
-      },
-    });
+If AWS CLI is not already present, install AWS CLI v2:
 
-    // Allow Lambda to read the secret at runtime (if you switch to runtime fetch).
-    apiSecret.grantRead(fn);
+```bash
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+aws --version
+```
 
-    // Lambda Function URL — no API Gateway needed, lower latency + cost.
-    const fnUrl = fn.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE,   // CloudFront is the auth/edge layer
-      cors: {
-        allowedOrigins: ["*"],
-        allowedMethods: [lambda.HttpMethod.GET, lambda.HttpMethod.OPTIONS],
-      },
-    });
+### 6. Set up Postgres
 
-    // ── S3 (static frontend) ──────────────────────────────────────────────────
-    const bucket = new s3.Bucket(this, "FrontendBucket", {
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      autoDeleteObjects: true,
-    });
+Create the app database:
 
-    // ── CloudFront ────────────────────────────────────────────────────────────
-    const distribution = new cloudfront.Distribution(this, "CDN", {
-      defaultRootObject: "index.html",
-      defaultBehavior: {
-        // Serve frontend from S3.
-        origin: origins.S3BucketOrigin.withOriginAccessControl(bucket),
-        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-        cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
-      },
-      additionalBehaviors: {
-        // Route /api/* to Lambda Function URL, bypassing S3.
-        "/api/*": {
-          origin: new origins.HttpOrigin(
-            cdk.Fn.select(2, cdk.Fn.split("/", fnUrl.url)),  // strip https://
-          ),
-          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
-          cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
-          allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
-          originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
-        },
-      },
-      // SPA fallback — serve index.html for any unknown path.
-      errorResponses: [
-        {
-          httpStatus: 403,
-          responseHttpStatus: 200,
-          responsePagePath: "/index.html",
-        },
-        {
-          httpStatus: 404,
-          responseHttpStatus: 200,
-          responsePagePath: "/index.html",
-        },
-      ],
-    });
+```bash
+sudo -u postgres createuser -s "$USER"
+createdb claude_usage_dashboard
+psql -d claude_usage_dashboard -c '\dt'
+```
 
-    // ── Deploy frontend to S3 ─────────────────────────────────────────────────
-    new s3deploy.BucketDeployment(this, "DeployFrontend", {
-      sources: [s3deploy.Source.asset(path.join(__dirname, "../../client/dist"))],
-      destinationBucket: bucket,
-      distribution,
-      distributionPaths: ["/*"],  // invalidate CloudFront cache on deploy
-    });
+This repo uses Postgres for persisted dashboard snapshots. That is what allows one user's loaded data to be reused later by other users for the same unfiltered ranges.
 
-    // ── Outputs ───────────────────────────────────────────────────────────────
-    new cdk.CfnOutput(this, "DashboardUrl", {
-      value: `https://${distribution.distributionDomainName}`,
-      description: "Claude Usage Dashboard URL",
-    });
-    new cdk.CfnOutput(this, "LambdaFunctionUrl", {
-      value: fnUrl.url,
-    });
-  }
+### 7. Clone the repo and install dependencies
+
+```bash
+git clone git@github.com:maherhanafi/claude-usage-dashboard.git
+cd claude-usage-dashboard
+npm --prefix client install
+npm --prefix server install
+```
+
+If you use HTTPS, a different SSH host alias, or a tarball instead of `git clone`, adjust accordingly.
+
+### 8. Create the server environment file from Secrets Manager
+
+Fetch the secret at deploy time and write only the values the app needs.
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id claude-usage-dashboard/prod \
+  --query SecretString \
+  --output text
+```
+
+Create `server/.env` with these values:
+
+```dotenv
+ANTHROPIC_ADMIN_KEY=REPLACE_ME
+ANTHROPIC_ANALYTICS_KEY=REPLACE_ME
+ANTHROPIC_VERSION=2023-06-01
+ANTHROPIC_BASE_URL=https://api.anthropic.com
+
+PORT=8787
+DATABASE_URL=postgres://YOUR_LINUX_USER@localhost:5432/claude_usage_dashboard
+PERSIST_HISTORY=true
+HISTORY_WARMUP_CONCURRENCY=4
+USE_MOCK=false
+```
+
+Do not commit this file.
+
+### 9. Build the app
+
+```bash
+npm --prefix client run build
+npm --prefix server run build
+```
+
+### 10. Start the app with PM2
+
+Run the backend from the repo root so it can find the built frontend.
+
+```bash
+pm2 start npm --name claude-dashboard -- run start
+pm2 save
+pm2 startup
+```
+
+Validate PM2:
+
+```bash
+pm2 status
+pm2 logs claude-dashboard --lines 100
+```
+
+### 11. Configure Nginx as a reverse proxy
+
+Create an Nginx site config:
+
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+        send_timeout 300s;
+    }
 }
 ```
 
----
-
-## Step 5 — Update the client API base URL for production
-
-The client currently calls relative `/api/...` URLs which works when the server also serves the frontend. In the S3+CloudFront deployment, CloudFront routes `/api/*` to Lambda, so relative URLs still work correctly — **no change needed**.
-
-If you ever point the client at a different domain, set `VITE_API_BASE` in `client/.env.production` and update `client/src/api.ts` to use `import.meta.env.VITE_API_BASE`.
-
----
-
-## Step 6 — Bootstrap and deploy
+Enable it:
 
 ```bash
-# One-time CDK bootstrap per account/region (run once ever)
-cdk bootstrap aws://YOUR_ACCOUNT_ID/us-east-1 --app infra
+sudo tee /etc/nginx/sites-available/claude-dashboard >/dev/null <<'EOF'
+server {
+    listen 80;
+    server_name _;
 
-# Deploy (from project root, so CDK can find the built assets)
-cd infra
-npx cdk deploy --require-approval never
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+        send_timeout 300s;
+    }
+}
+EOF
+
+sudo ln -sf /etc/nginx/sites-available/claude-dashboard /etc/nginx/sites-enabled/claude-dashboard
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
 ```
 
-CDK will output the CloudFront URL when done:
+The extended timeouts matter for cold `180d` requests. We hit `504 Gateway Timeout` until these were increased.
 
-```
-Outputs:
-InfraStack.DashboardUrl = https://d1abc2defg.cloudfront.net
-```
+### 12. Verify the deployment
 
-Open that URL — you're live.
-
----
-
-## Step 7 — Subsequent deploys
-
-After making code changes:
+Local checks on the box:
 
 ```bash
-# 1. Build both packages
-cd client && npm run build && cd ..
-cd server && npm run build && cd ..
-
-# 2. Deploy (CDK diffs and updates only what changed)
-cd infra && npx cdk deploy
+curl http://127.0.0.1:8787/api/health
+curl "http://127.0.0.1:8787/api/dashboard?period=180d"
 ```
 
-The `BucketDeployment` automatically invalidates the CloudFront cache, so users always get the latest frontend immediately.
-
----
-
-## Optional: Persistent cache with DynamoDB
-
-The default in-memory cache lives only within a single Lambda instance. For a small internal dashboard this is fine — warm instances reuse it, and cold starts just make a fresh Anthropic API call. If you want cache to survive across instances (or to keep all Lambda instances warm), use DynamoDB:
-
-1. Add a DynamoDB table to the CDK stack:
-
-```typescript
-import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
-
-const cacheTable = new dynamodb.Table(this, "DashboardCache", {
-  partitionKey: { name: "cacheKey", type: dynamodb.AttributeType.STRING },
-  timeToLiveAttribute: "ttl",
-  billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-  removalPolicy: cdk.RemovalPolicy.DESTROY,
-});
-cacheTable.grantReadWriteData(fn);
-fn.addEnvironment("CACHE_TABLE", cacheTable.tableName);
-```
-
-2. Replace the `Map<string, CacheEntry>` in `dashboardService.ts` with DynamoDB `GetItem`/`PutItem` calls using the AWS SDK v3 (`@aws-sdk/client-dynamodb`).
-
----
-
-## Optional: Custom domain
-
-Add a Route 53 hosted zone and ACM certificate to the CDK stack and attach them to the CloudFront distribution:
-
-```typescript
-import * as acm from "aws-cdk-lib/aws-certificatemanager";
-import * as route53 from "aws-cdk-lib/aws-route53";
-import * as targets from "aws-cdk-lib/aws-route53-targets";
-
-const zone = route53.HostedZone.fromLookup(this, "Zone", {
-  domainName: "yourdomain.com",
-});
-
-const cert = new acm.Certificate(this, "Cert", {
-  domainName: "claude-dashboard.yourdomain.com",
-  validation: acm.CertificateValidation.fromDns(zone),
-});
-
-// Add to Distribution props:
-// domainNames: ["claude-dashboard.yourdomain.com"],
-// certificate: cert,
-
-new route53.ARecord(this, "AliasRecord", {
-  zone,
-  recordName: "claude-dashboard",
-  target: route53.RecordTarget.fromAlias(
-    new targets.CloudFrontTarget(distribution),
-  ),
-});
-```
-
----
-
-## Estimated AWS costs
-
-| Service | Usage | Estimated monthly cost |
-|---------|-------|------------------------|
-| Lambda | ~1,000 invocations/month, 512MB, <5s avg | < $0.01 |
-| CloudFront | ~10 GB transfer/month | ~$0.85 |
-| S3 | ~5 MB static assets | < $0.01 |
-| Secrets Manager | 1 secret | $0.40 |
-| DynamoDB (optional) | On-demand, minimal writes | < $0.10 |
-| **Total** | | **~$1.50/month** |
-
-The dominant cost is CloudFront data transfer. For an internal team dashboard the actual cost is likely under $1/month.
-
----
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `/api/*` returns 403 | CloudFront can't reach Lambda Function URL | Check the `fnUrl` origin hostname is correctly extracted; verify Lambda function URL is public |
-| `502 Bad Gateway` from CloudFront | Lambda threw an error or timed out | Check CloudWatch Logs for the Lambda function |
-| Frontend shows "Loading…" forever | API calls going to wrong URL | Open browser DevTools → Network tab; verify `/api/dashboard` returns JSON |
-| Lambda cold start > 10s on 90d range | 3 parallel 31-day Anthropic API chunks | Normal. Consider keeping Lambda warm with a CloudWatch scheduled ping every 5 minutes |
-| `Cannot find module './lambda.js'` | Lambda handler path wrong | Ensure `handler: "lambda.handler"` and `server/dist/lambda.js` exists after build |
-| ESM import errors in Lambda | Node 20 + `"type":"module"` | Lambda Node 20 runtime supports ESM. Ensure `tsconfig.json` targets `ES2022`/`ESNext` and `module: "NodeNext"` |
-
----
-
-## Quick reference — all commands
+Public checks:
 
 ```bash
-# First-time setup
-cd server && npm install @vendia/serverless-express && npm install -D @types/aws-lambda && cd ..
-mkdir infra && cd infra && npx cdk init app --language typescript && npm install aws-cdk-lib constructs && cd ..
-aws secretsmanager create-secret --name "claude-dashboard/api-keys" \
-  --secret-string '{"ANTHROPIC_ANALYTICS_KEY":"...","ANTHROPIC_ADMIN_KEY":"..."}'
-cdk bootstrap aws://ACCOUNT_ID/REGION --app infra
+curl http://YOUR_PUBLIC_IP/api/health
+curl "http://YOUR_PUBLIC_IP/api/dashboard?period=180d"
+```
 
-# Every deploy
-cd client && npm run build && cd ..
-cd server && npm run build && cd ..
-cd infra && npx cdk deploy
+Expected health response should include:
+
+- `ok: true`
+- `source: analytics`
+- `persistenceEnabled: true`
+
+### 13. Make the app start on reboot
+
+If `pm2 startup` prints a command, run that command with `sudo`, then run:
+
+```bash
+pm2 save
+```
+
+Reboot test:
+
+```bash
+sudo reboot
+```
+
+After reconnecting:
+
+```bash
+pm2 status
+curl http://127.0.0.1:8787/api/health
+```
+
+---
+
+## How cached and persisted data behaves on EC2
+
+For the current backend:
+
+- repeated requests in the same running process can reuse the in-memory cache
+- persisted dashboard snapshots are stored in Postgres
+- when no filters are selected, the backend can reuse previously loaded period data from Postgres instead of calling Anthropic again
+
+That means one user's warmup or unfiltered load can make later unfiltered loads faster for other users.
+
+Filtered requests can still require fresh computation or upstream fetches depending on the exact slice requested.
+
+---
+
+## Operations notes
+
+### Logs
+
+```bash
+pm2 logs claude-dashboard --lines 200
+sudo journalctl -u nginx -n 100 --no-pager
+```
+
+### CPU and memory usage over SSH
+
+```bash
+top
+free -h
+df -h
+vmstat 1 5
+```
+
+If you want a friendlier view:
+
+```bash
+sudo apt install -y htop
+htop
+```
+
+### Postgres checks
+
+```bash
+psql -d claude_usage_dashboard -c '\dt'
+psql -d claude_usage_dashboard -c 'select count(*) from dashboard_snapshots;'
+```
+
+### DNS and friendly URL
+
+For a friendlier address:
+
+1. Allocate and attach an Elastic IP.
+2. Create a DNS `A` record pointing at it.
+3. Optionally add Nginx TLS with Let's Encrypt or put CloudFront/ALB in front later.
+
+---
+
+## Known caveats
+
+- The optional monthly cost analysis feature expects an OpenAI-compatible endpoint, defaulting to `http://localhost:1234/v1`.
+- If that service is not running on EC2, that feature will be degraded or should be disabled.
+- First-load `180d` requests can take long enough to require increased reverse-proxy timeouts.
+- Do not store secrets directly in the repo or bake them into images.
+
+---
+
+## Cost expectations
+
+### Serverless
+
+Usually lowest idle cost, but only worth it if you are willing to adapt the backend architecture.
+
+### EC2
+
+Expect cost from:
+
+- EC2 instance
+- EBS volume
+- Elastic IP if unused or detached
+- optional Route 53 hosted zone and DNS queries
+
+For a small internal deployment, a single `t3.small` or `t3.medium` is usually the right starting point.
+
+---
+
+## Quick reference
+
+### Fastest path for this repo
+
+1. Launch Ubuntu EC2.
+2. Attach Elastic IP.
+3. Store Anthropic keys in Secrets Manager.
+4. Attach EC2 IAM role with secret read access.
+5. Install Node 20, PM2, Nginx, Postgres, AWS CLI.
+6. Clone repo and install dependencies.
+7. Create `server/.env` from the secret.
+8. Build client and server.
+9. Start with PM2.
+10. Put Nginx in front with 300s read timeout.
+11. Verify `/api/health` and `/api/dashboard?period=180d`.
+
+### Subsequent deploys on EC2
+
+```bash
+cd ~/claude-usage-dashboard
+git pull
+npm --prefix client install
+npm --prefix server install
+npm --prefix client run build
+npm --prefix server run build
+pm2 restart claude-dashboard
 ```
